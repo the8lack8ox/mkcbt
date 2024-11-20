@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
 // Unique file names
-pub fn generate_unique_file_name(dir: &Path, ext: &str) -> PathBuf {
+fn generate_unique_file_name(dir: &Path, ext: &str) -> PathBuf {
     let mut time_val = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -46,12 +46,12 @@ pub fn generate_unique_file_name(dir: &Path, ext: &str) -> PathBuf {
 }
 
 // Temporary directories
-pub struct TempDir {
+struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    pub fn new(prefix: &str) -> Self {
+    fn new(prefix: &str) -> Self {
         let mut time_val = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -68,7 +68,7 @@ impl TempDir {
         Self { path }
     }
 
-    pub fn path(&self) -> &Path {
+    fn path(&self) -> &Path {
         self.path.as_path()
     }
 }
@@ -79,8 +79,8 @@ impl Drop for TempDir {
     }
 }
 
-// TAR files
-pub struct SimpleTarArchive {
+// Basic TAR files
+struct SimpleTarArchive {
     writer: Box<dyn Write>,
     mtime: u64,
 }
@@ -88,7 +88,7 @@ pub struct SimpleTarArchive {
 impl SimpleTarArchive {
     const ZEROS: [u8; 1024] = [0; 1024];
 
-    pub fn new(writer: impl Write + 'static) -> Self {
+    fn new(writer: impl Write + 'static) -> Self {
         Self {
             writer: Box::new(writer),
             mtime: SystemTime::now()
@@ -98,11 +98,11 @@ impl SimpleTarArchive {
         }
     }
 
-    pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
+    fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(Self::new(File::create(path)?))
     }
 
-    pub fn write_file<P: AsRef<Path>>(&mut self, in_path: P, file_name: String) -> Result<()> {
+    fn write_file<P: AsRef<Path>>(&mut self, in_path: P, file_name: String) -> Result<()> {
         let file_len = in_path.as_ref().metadata()?.len() as usize;
         let mut in_file = File::open(in_path)?;
 
