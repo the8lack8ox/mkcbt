@@ -1,5 +1,5 @@
 //
-// Copyright 2024 Christopher Atherton <the8lack8ox@pm.me>
+// Copyright 2024-2025 Christopher Atherton <the8lack8ox@pm.me>
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the “Software”), to
@@ -22,28 +22,11 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{Result, Write};
+use std::io::{Error, ErrorKind, Result, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
-
-// Unique file names
-fn generate_unique_file_name(dir: &Path, ext: &str) -> PathBuf {
-    let mut time_val = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
-    let mut path = dir.join(format!("{:08x}{ext}", time_val));
-    while path.exists() {
-        time_val = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
-        path = dir.join(format!("{:08x}{ext}", time_val));
-    }
-    path
-}
 
 // Temporary directories
 struct TempDir {
@@ -82,7 +65,6 @@ impl Drop for TempDir {
 // Basic TAR files
 struct SimpleTarArchive {
     writer: Box<dyn Write>,
-    mtime: u64,
 }
 
 impl SimpleTarArchive {
@@ -91,10 +73,6 @@ impl SimpleTarArchive {
     fn new(writer: impl Write + 'static) -> Self {
         Self {
             writer: Box::new(writer),
-            mtime: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
         }
     }
 
@@ -102,19 +80,18 @@ impl SimpleTarArchive {
         Ok(Self::new(File::create(path)?))
     }
 
-    fn write_file<P: AsRef<Path>>(&mut self, in_path: P, file_name: String) -> Result<()> {
-        let file_len = in_path.as_ref().metadata()?.len() as usize;
-        let mut in_file = File::open(in_path)?;
+    fn write_file<P: AsRef<Path>>(&mut self, path: P, file_name: &str) -> Result<()> {
+        let file_len = path.as_ref().metadata()?.len();
+        let mut file = File::open(path)?;
 
         // Create header
         let mut header = [0; 512];
-        let file_name_bytes = file_name.as_bytes();
-        header[..file_name_bytes.len()].copy_from_slice(file_name_bytes); // Filename
+        header[..file_name.len()].copy_from_slice(file_name.as_bytes()); // Filename
         header[100..107].copy_from_slice(b"0000444"); // Permissions
         header[108..115].copy_from_slice(b"0000000"); // Owner ID
         header[116..123].copy_from_slice(b"0000000"); // Group ID
         header[124..135].copy_from_slice(format!("{:011o}", file_len).as_bytes()); // File size
-        header[136..147].copy_from_slice(format!("{:011o}", self.mtime).as_bytes()); // Modification time
+        header[136..147].copy_from_slice(b"00000000000"); // Modification time
         header[148..156].copy_from_slice(b"        "); // Checksum (for now)
         header[156] = b'0'; // Link indicator
         header[257..262].copy_from_slice(b"ustar"); // UStar indicator
@@ -122,19 +99,18 @@ impl SimpleTarArchive {
 
         // Calculate checksum
         let checksum: u32 = header.iter().map(|x| *x as u32).sum();
-        let checksum_str = format!("{:06o}\0", checksum);
-        header[148..155].copy_from_slice(checksum_str.as_bytes());
+        header[148..155].copy_from_slice(format!("{:06o}\0", checksum).as_bytes());
 
         // Write header
         self.writer.write_all(&header)?;
 
         // Copy file
-        std::io::copy(&mut in_file, &mut self.writer)?;
+        std::io::copy(&mut file, &mut self.writer)?;
 
         // Add padding
         if file_len % 512 != 0 {
             self.writer
-                .write_all(&Self::ZEROS[..512 - file_len % 512])?;
+                .write_all(&Self::ZEROS[..(512 - file_len % 512) as usize])?;
         }
 
         Ok(())
@@ -155,185 +131,173 @@ impl Drop for SimpleTarArchive {
     }
 }
 
-const PROGRAM_NAME: &str = "mkcbt";
-const USAGE_MESSAGE: &str = "Usage: mkcbt [--avif] OUTPUT INPUT [INPUT]...";
-type ArchiveType = SimpleTarArchive;
+enum CbtWriterJob {
+    Copy(PathBuf, usize),
+    Convert(Child, PathBuf, usize),
+}
 
-fn convert_avif(in_path: &Path, out_path: &Path) -> Child {
-    match Command::new("avifenc")
-        .arg(in_path)
-        .arg(out_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(proc) => proc,
-        Err(_) => {
-            eprintln!("ERROR! Failed to run avifenc on `{}`", in_path.display());
-            std::process::exit(1);
-        }
+struct CbtWriter {
+    tar: SimpleTarArchive,
+    jobs: VecDeque<CbtWriterJob>,
+    index: usize,
+    padding: usize,
+    processes: usize,
+    work_dir: TempDir,
+}
+
+impl CbtWriter {
+    fn new(writer: impl Write + 'static, padding: usize) -> Result<Self> {
+        let processes = std::thread::available_parallelism()?.get();
+        Ok(Self {
+            tar: SimpleTarArchive::new(writer),
+            jobs: VecDeque::with_capacity(processes),
+            index: 1,
+            padding,
+            processes,
+            work_dir: TempDir::new("mkcbt"),
+        })
     }
-}
 
-#[derive(Clone, PartialEq)]
-enum Conversion {
-    Copy,
-    Avif,
-}
+    fn create<P: AsRef<Path>>(path: P, padding: usize) -> Result<Self> {
+        let processes = std::thread::available_parallelism()?.get();
+        Ok(Self {
+            tar: SimpleTarArchive::create(path)?,
+            jobs: VecDeque::with_capacity(processes),
+            index: 1,
+            padding,
+            processes,
+            work_dir: TempDir::new("mkcbt"),
+        })
+    }
 
-struct Task {
-    path: PathBuf,
-    conversion: Conversion,
-    convert_proc: Option<Child>,
-}
-
-impl Task {
-    fn new(in_path: &Path, conversion: Conversion, work_dir: &Path) -> Self {
-        match conversion {
-            Conversion::Copy => Self {
-                path: in_path.to_path_buf(),
-                conversion,
-                convert_proc: None,
-            },
-            Conversion::Avif => {
-                let out_path = generate_unique_file_name(work_dir, ".avif");
-                let proc = convert_avif(in_path, &out_path);
-                Self {
-                    path: out_path,
-                    conversion,
-                    convert_proc: Some(proc),
+    fn submit(&mut self, path: &Path) -> Result<()> {
+        while self.jobs.len() >= self.processes {
+            let job = self.jobs.pop_front().unwrap();
+            match job {
+                CbtWriterJob::Copy(path, index) => self
+                    .tar
+                    .write_file(path, &format!("{:0fill$}.avif", index, fill = self.padding))?,
+                CbtWriterJob::Convert(mut proc, path, index) => {
+                    if !proc.wait()?.success() {
+                        return Err(Error::new(ErrorKind::Other, "avifenc returned failure"));
+                    }
+                    self.tar.write_file(
+                        &path,
+                        &format!("{:0fill$}.avif", index, fill = self.padding),
+                    )?;
+                    fs::remove_file(path)?;
                 }
             }
         }
-    }
-
-    fn finish(&mut self, index: usize, width: usize, archive: &mut ArchiveType) -> Result<()> {
-        if let Some(ref mut child) = self.convert_proc {
-            if !child.wait()?.success() {
-                eprintln!("ERROR! Image encoding process returned failure");
-                std::process::exit(1);
+        match path.extension() {
+            Some(ext) => {
+                if !ext.eq_ignore_ascii_case("avif") {
+                    let tmp_path = self.work_dir.path().join(format!(
+                        "{:0fill$}.avif",
+                        self.index,
+                        fill = self.padding
+                    ));
+                    self.jobs.push_back(CbtWriterJob::Convert(
+                        Command::new("avifenc")
+                            .args(["--jobs", "1"])
+                            .args(["--speed", "0"])
+                            .arg(path)
+                            .arg(&tmp_path)
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()?,
+                        tmp_path,
+                        self.index,
+                    ))
+                } else {
+                    self.jobs
+                        .push_back(CbtWriterJob::Copy(path.to_path_buf(), self.index));
+                }
+            }
+            None => {
+                let tmp_path = self.work_dir.path().join(format!(
+                    "{:0fill$}.avif",
+                    self.index,
+                    fill = self.padding
+                ));
+                self.jobs.push_back(CbtWriterJob::Convert(
+                    Command::new("avifenc")
+                        .args(["--jobs", "1"])
+                        .args(["--speed", "0"])
+                        .arg(path)
+                        .arg(&tmp_path)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()?,
+                    tmp_path,
+                    self.index,
+                ))
             }
         }
-        let ext = match self.conversion {
-            Conversion::Copy => match self.path.extension() {
-                Some(ext) => {
-                    String::from(".") + ext.to_string_lossy().to_ascii_lowercase().as_str()
+        self.index += 1;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        while let Some(job) = self.jobs.pop_front() {
+            match job {
+                CbtWriterJob::Copy(path, index) => self
+                    .tar
+                    .write_file(path, &format!("{:0fill$}.avif", index, fill = self.padding))?,
+                CbtWriterJob::Convert(mut proc, path, index) => {
+                    if !proc.wait()?.success() {
+                        return Err(Error::new(ErrorKind::Other, "avifenc returned failure"));
+                    }
+                    self.tar.write_file(
+                        &path,
+                        &format!("{:0fill$}.avif", index, fill = self.padding),
+                    )?;
+                    fs::remove_file(path)?;
                 }
-                None => String::new(),
-            },
-            Conversion::Avif => String::from(".avif"),
-        };
-        archive.write_file(&self.path, format!("{:0fill$}{ext}", index, fill = width))?;
-        if self.conversion != Conversion::Copy {
-            fs::remove_file(&self.path).expect("Could not remove temporary image file");
+            }
         }
         Ok(())
     }
 }
 
 fn run() -> Result<()> {
-    // Check command line
     if env::args().len() < 3 {
-        eprintln!("{USAGE_MESSAGE}");
+        eprintln!("USAGE: mkcbt OUTPUT.cbt INPUTS...");
         std::process::exit(1);
     }
-    let conversion = match env::args().nth(1).unwrap().as_str() {
-        "--avif" => Conversion::Avif,
-        _ => Conversion::Copy,
-    };
-    let output_path;
-    let cli_inputs: Vec<_>;
-    if conversion == Conversion::Copy {
-        output_path = env::args().nth(1).unwrap();
-        cli_inputs = env::args().skip(2).map(PathBuf::from).collect();
-    } else {
-        if env::args().len() < 4 {
-            eprintln!("{USAGE_MESSAGE}");
-            std::process::exit(1);
+
+    let cl_inputs: Vec<_> = env::args().skip(2).map(PathBuf::from).collect();
+    let mut inputs = Vec::new();
+    for cl_input in cl_inputs {
+        if !cl_input.exists() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("'{}' does not exist", cl_input.display()),
+            ));
         }
-        output_path = env::args().nth(2).unwrap();
-        cli_inputs = env::args().skip(3).map(PathBuf::from).collect();
+        if cl_input.is_dir() {
+            let mut files: Vec<_> = fs::read_dir(cl_input)?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|path| path.is_file())
+                .collect();
+            files.sort();
+            inputs.append(&mut files);
+        } else {
+            inputs.push(cl_input);
+        }
     }
 
-    // Collect inputs
-    let mut inputs;
-    if cli_inputs.len() == 1 && cli_inputs[0].is_dir() {
-        inputs = Vec::new();
-        for entry in fs::read_dir(&cli_inputs[0])? {
-            let path = entry?.path();
-            if !path.is_file() {
-                eprintln!("ERROR! `{}` is not a file", path.display());
-                std::process::exit(1);
-            }
-            inputs.push(path);
-        }
-        if inputs.is_empty() {
-            eprintln!("ERROR! `{}` is empty", cli_inputs[0].display());
-            std::process::exit(1);
-        }
+    let output = env::args().nth(1).unwrap();
+    let mut cbt = if output == "-" {
+        CbtWriter::new(std::io::stdout(), inputs.len().to_string().len())?
     } else {
-        inputs = cli_inputs;
-        for path in &inputs {
-            if !path.exists() {
-                eprintln!("ERROR! File `{}` does not exist", path.display());
-                std::process::exit(1);
-            }
-            if !path.is_file() {
-                eprintln!("ERROR! `{}` is not a file", path.display());
-                std::process::exit(1);
-            }
-        }
-    }
-    inputs.sort();
-    let width = inputs.len().to_string().len();
-    let mut inputs_queue = VecDeque::from(inputs);
-
-    // Create output file
-    let mut archive = if output_path == "-" {
-        ArchiveType::new(std::io::stdout())
-    } else {
-        ArchiveType::create(PathBuf::from(output_path))?
+        CbtWriter::create(output, inputs.len().to_string().len())?
     };
 
-    // Create work directory
-    let work_path;
-    let _work_dir;
-    match conversion {
-        Conversion::Copy => {
-            work_path = PathBuf::new();
-            _work_dir = None;
-        }
-        _ => {
-            let tmp_dir = TempDir::new(PROGRAM_NAME);
-            work_path = tmp_dir.path().to_path_buf();
-            _work_dir = Some(tmp_dir);
-        }
+    for file in inputs {
+        cbt.submit(file.as_path())?;
     }
-
-    // Process
-    let process_count = std::thread::available_parallelism()?.get();
-    let mut task_queue = VecDeque::with_capacity(process_count);
-    for _ in 0..(std::cmp::min(inputs_queue.len(), process_count) - 1) {
-        let input = inputs_queue.pop_front().unwrap();
-        task_queue.push_back(Task::new(&input, conversion.clone(), &work_path));
-    }
-    let mut index = 0;
-    while let Some(input) = inputs_queue.pop_front() {
-        // Submit new job
-        task_queue.push_back(Task::new(&input, conversion.clone(), &work_path));
-
-        // Finish front job
-        index += 1;
-        task_queue
-            .pop_front()
-            .unwrap()
-            .finish(index, width, &mut archive)?;
-    }
-    // Finish rest of jobs
-    while let Some(mut task) = task_queue.pop_front() {
-        index += 1;
-        task.finish(index, width, &mut archive)?;
-    }
+    cbt.finish()?;
 
     Ok(())
 }
@@ -342,7 +306,7 @@ fn main() {
     match run() {
         Ok(()) => (),
         Err(err) => {
-            eprintln!("{err}");
+            eprintln!("ERROR: {err}");
             std::process::exit(1);
         }
     }

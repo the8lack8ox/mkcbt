@@ -1,9 +1,9 @@
 [package]
 name = "mkcbt"
-description = "Merge images into comic book archive (TAR format)"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Pack images into comic book archive (TAR format)"
 authors = ["Christopher Atherton <the8lack8ox@pm.me>"]
 
 [dependencies]
