@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Result, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
@@ -302,12 +302,12 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn main() {
+fn main() -> ExitCode {
     match run() {
-        Ok(()) => (),
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("ERROR: {err}");
-            std::process::exit(1);
+            ExitCode::FAILURE
         }
     }
 }
