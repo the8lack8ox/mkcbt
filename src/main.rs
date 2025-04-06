@@ -98,7 +98,7 @@ impl SimpleTarArchive {
         header[263..265].copy_from_slice(b"00"); // UStar version
 
         // Calculate checksum
-        let checksum: u32 = header.iter().map(|x| *x as u32).sum();
+        let checksum: u32 = header.iter().map(|&x| x as u32).sum();
         header[148..155].copy_from_slice(format!("{:06o}\0", checksum).as_bytes());
 
         // Write header
@@ -289,9 +289,9 @@ fn run() -> Result<()> {
 
     let output = env::args().nth(1).unwrap();
     let mut cbt = if output == "-" {
-        CbtWriter::new(std::io::stdout(), inputs.len().to_string().len())?
+        CbtWriter::new(std::io::stdout(), inputs.len().ilog10() as usize + 1)?
     } else {
-        CbtWriter::create(output, inputs.len().to_string().len())?
+        CbtWriter::create(output, inputs.len().ilog10() as usize + 1)?
     };
 
     for file in inputs {
